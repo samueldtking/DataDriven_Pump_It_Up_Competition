@@ -1,0 +1,12 @@
+Open RDM - full instructions avalible at the top:
+
+## INSTRUCTIONS FOR RUNNING:
+    #1. MAKE SURE ALL LIBRARY PACKAGES ARE INSTALLED (LIST BELOW)
+    #2. MAKE SURE YOU ARE IN THE WORKING DIRECTORY OF THIS ZIPFOLDER AS THERE ARE SEVERAL EXTERNAL FILES 
+    #3. RUN ENTIRE RMD BELOW (THIS MAY TAKE UP TO 15M AS IT RECOMPUTES THE RANDOM FOREST ETC.)
+    #4. SCROSS TO THE BOTTOM AND ADD YOUR FILEPATH THE THE evaulate() FUNCTION
+    #5. THIS SHOULD OUTPUT A DATAFRAME CALLED 'final_submission' IN THE SUBMISSION FORMAT 
+    
+    # If for whatever reason this does not work the full model is avalible in the model section (in the Random Forest chuck, with the model called 'fit')
+    # Please do not hesitate to contact me if there are any problems as this submission format it quite unstable when working with external sources 
+    # Contact me at (samuel.king@student.ie.edu)

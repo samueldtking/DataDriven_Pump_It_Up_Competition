@@ -1,0 +1,1013 @@
+---
+title: "Pump It Up Competition"
+author: "Samuel King"
+date: "22 March 2017"
+output: pdf_document
+---
+
+
+
+## Loading libraries & data 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries, include=FALSE}
+
+library(readr)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(lubridate)
+library(gdata)
+library(rpart)
+library(randomForest)
+library(h2o)
+library(xgboost)
+library(googleVis)
+library(caret)
+library(MASS)
+library(mlbench)
+library(RecordLinkage)
+library(Matching)
+library(stringdist)
+library(maps)       
+library(mapdata)
+library(ggmap)
+
+```
+
+```{r load data, include=FALSE}
+
+internal_training_values <- read_csv("internal-training-values.csv")
+internal_training_labels <- read_csv("internal-training-labels.csv")
+internal_submission_format <- read_delim("internal submission format.csv", ";", escape_double = FALSE, trim_ws = TRUE)
+
+train_full <- merge(internal_training_values, internal_training_labels, by="id")
+original_full <- merge(internal_training_values, internal_training_labels, by="id")
+
+str(train_full)
+
+```
+
+## DATA CLEANING - GENERAL
+```{r cleaning the target variable}
+
+## TARGET VARIABLE EXPLORATION 
+# explore target
+train_full$status_group = as.factor(train_full$status_group)
+summary(train_full$status_group)
+plot(train_full$status_group)
+
+status_group_prop_table = prop.table(table(train_full$status_group))
+status_group_prop_table
+
+g <- qplot(factor(status_group), data=train_full, geom="bar", fill=factor(status_group))
+
+g
+```
+
+```{r Common sense cleaning}
+
+# Cleaning 0 values for variables where 0 does not make sense
+# i.e: `funder`, `installer`, `gps_height`, `population`, `construction_year`
+
+train_full_checkpoint1 <- train_full
+
+train_full = train_full %>%
+  mutate(funder = ifelse(funder == 0, NA, funder)) %>%
+  mutate(installer = ifelse(installer == 0, NA, installer)) %>%
+  mutate(gps_height = ifelse(gps_height == 0, NA, gps_height)) %>%
+  mutate(population = ifelse(population == 0, NA, population)) %>%
+  mutate(amount_tsh = ifelse(amount_tsh == 0, NA, amount_tsh)) %>%
+  mutate(construction_year = ifelse(construction_year == 0, NA, construction_year))
+
+
+#' For every categorical response, convert the levels to lower case, in case there is random capitalization.
+chr.cols = train_full %>% summarise_each(funs(is.character(.))) %>% unlist() %>% which() %>% names()
+train_full = train_full %>% mutate_each( funs(tolower), one_of(chr.cols))
+
+```
+
+```{r Create custom variables for data cleaning}
+## REDUCE NUMBER OF FACTORS 
+  # Three functions to reduce the number of levels of a categorical variable
+  # by grouping the smaller levels into "other"
+  
+  reduce.num.levels = function(x, nlevels = 12) {
+    levels = table(x)
+    if ( n_distinct(x) > (nlevels+1) )  {
+      small.levels = names(sort(levels, decreasing = TRUE)[ - seq(nlevels)])
+      x[x %in% small.levels] = "other"
+    }
+    return (x)
+  }
+reduce.size.levels = function(x, min.size = 500) {
+  levels = table(x)
+  if ( min(levels) < min.size) {
+    small.levels = names(levels[levels < min.size])
+    x[x %in% small.levels] = "other"
+  }
+  return (x)
+}
+myreduce.levels = function(x) {
+  return (reduce.num.levels(reduce.size.levels(x)))
+}
+
+```
+
+```{r population' = add external population sources}
+
+
+#population 1 seems unlikely 
+
+wardpopulation <- read_csv("wardpopulation.csv")
+wardpop <- wardpopulation
+wardpop$Name <- tolower(wardpop$Name)
+names(wardpop)[1]<-paste("ward")
+names(wardpop)[2]<-paste("ward_status")
+names(wardpop)[3]<-paste("ext_population_2002")
+names(wardpop)[4]<-paste("ext_population_2016")
+names(wardpop)[5]<-paste("ext_region")
+
+wardpop <- wardpop %>% group_by(ward)
+wardpop <- wardpop[!duplicated(wardpop$ward),]
+
+train_full$ward <- tolower(train_full$ward)
+
+#check if they match 
+intersect(wardpop$ward, train_full$ward)
+length(intersect(wardpop$ward, train_full$ward))
+
+# create new column with population from external to compare 
+
+train_full = merge(x = train_full, y = wardpop, by = "ward", all.x = TRUE)
+train_full = unique(train_full[,c(1:41,43,44)])
+
+train_full[ train_full = "..." ] = NA
+
+train_full$ext_population_2002[train_full$ext_population_2002 == '...' ] <- NA
+train_full$ext_population_2016[train_full$ext_population_2016 == '...' ] <- NA
+
+train_full$ext_population_2002 <- as.numeric(gsub(",", "", as.character(train_full$ext_population_2002)))
+train_full$ext_population_2016 <- as.numeric(gsub(",", "", as.character(train_full$ext_population_2016)))
+
+train_full %>% select(-ext_po)
+
+```
+
+## DATA CLEANING - CHARACTERISTIC VARIABLES 
+```{r Remove 'recorded_by' - only one factor}
+# as this has only one factor it is not helpful
+
+# All 'recorded_by' values are the same 'geodata consultants ltf' so it can be removed 
+summary(as.factor(train_full$recorded_by))
+
+train_full = train_full %>% dplyr::select(-recorded_by)
+
+```
+
+```{r extraction_type`, `extraction_type_group`, `extraction_type_class`}
+#`extraction_type`, `extraction_type_group`, `extraction_type_class`
+#' I remove the middle level `extraction_type_group` and combine some of the smaller levels, mostly by brand. For example, I combine *swn 80* and *swn 81* into *swn*.
+train_full_checkpoint2 = train_full
+
+
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "cemo", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "climax", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "other - mkulima/shinyanga", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "other - play pump", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "walimi", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "other - swn 81", "othermotorpump",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "swn 80", "swn",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "india mark ii", "india mark",extraction_type))
+train_full <-train_full %>% mutate(extraction_type = ifelse(extraction_type == "india mark iii",  "india mark",extraction_type))
+
+train_full <-train_full %>% dplyr::select(-extraction_type_group)
+
+
+train_full$extraction_type = as.factor(train_full$extraction_type)
+train_full$extraction_type_class = as.factor(train_full$extraction_type_class)
+summary(as.factor(train_full$extraction_type))
+
+table(train_full$extraction_type, train_full$status_group)
+prop.table(table(train_full$extraction_type, train_full$status_group), margin = 1)
+qplot(extraction_type, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+table(train_full$extraction_type_class, train_full$status_group)
+prop.table(table(train_full$extraction_type_class, train_full$status_group), margin = 1)
+qplot(extraction_type_class, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+# other has more non functional than proporitional 
+```
+
+```{r `scheme_management`, `scheme_name` - drop scheme name, change none to other in scheme management}
+# `scheme_management`, `scheme_name`
+#' I remove `scheme name` as it has too many levels, often with one or handful of examples.
+#' also change the single 'none' to an other 
+train_full_checkpoint3 = train_full
+
+train_full %>% group_by(scheme_management, scheme_name) %>% tally()
+train_full = train_full %>% dplyr::select( - scheme_name)
+
+train_full = train_full %>% mutate(scheme_management = ifelse(scheme_management == 'none', 'other', scheme_management))  
+
+train_full$scheme_management = as.factor(train_full$scheme_management)
+summary(train_full$scheme_management)
+
+table(train_full$scheme_management, train_full$status_group)
+prop.table(table(train_full$scheme_management, train_full$status_group), margin = 1)
+qplot(scheme_management, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+```{r `payment`, `payment_type`}
+#`payment`, `payment_type`
+#' #Some categories are renamed but otherwise these features are exactly the same. I keep `payment_type`.
+
+train_full %>% group_by(payment_type, payment) %>% tally()
+train_full = train_full %>% dplyr::select( - payment )
+
+train_full$payment_type = as.factor(train_full$payment_type)
+summary(train_full$payment_type)
+
+table(train_full$payment_type, train_full$status_group)
+prop.table(table(train_full$payment_type, train_full$status_group), margin = 1)
+qplot(payment_type, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r `water_quality`, `quality_group`}
+
+#`water_quality`, `quality_group`
+#' I keep the more precise factor `water_quality`.
+
+train_full %>% group_by(quality_group, water_quality) %>% tally()
+train_full = train_full %>% dplyr::select( - quality_group)
+
+train_full$water_quality = as.factor(train_full$water_quality)
+summary(as.factor(train_full$water_quality))
+
+table(train_full$water_quality, train_full$status_group)
+prop.table(table(train_full$water_quality, train_full$status_group), margin = 1)
+qplot(water_quality, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+# change NAs to unknown as seems to be many NAs which are non-functional 
+train_full$water_quality = addNA(train_full$water_quality)
+levels(train_full$water_quality)[is.na(levels(train_full$water_quality))] <- "unknown"
+table(train_full$water_quality)
+
+
+
+```
+
+```{r `quantity`, `quantity_group`}
+
+#'`quantity`, `quantity_group`
+#'These features are exactly the same. I keep `quantity`.
+
+train_full %>% group_by(quantity_group, quantity) %>% tally()
+train_full = train_full %>% dplyr::select( - quantity_group)
+
+train_full$quantity = as.factor(train_full$quantity)
+summary(train_full$quantity)
+
+
+table(train_full$quantity, train_full$status_group)
+prop.table(table(train_full$quantity, train_full$status_group), margin = 1)
+prop.table(table(train_full$quantity, train_full$status_group), margin = 2)
+qplot(quantity, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+table(train_full$quantity, train_full$status_group)
+
+```
+
+```{r `source`, `source_type`, `source_class`}
+#'`source`, `source_type`, `source_class`
+# I remove the middle level `source_type`. I am not sure if *other* means other or unknown, so I relabel *other* as NA.
+
+train_full %>% group_by(source_class, source_type, source) %>% tally()
+
+train_full = train_full %>% mutate(source = revalue(source,c("other" = NA))) %>% dplyr::select( - source_type)
+
+train_full$source = as.factor(train_full$source)
+train_full$source_class = as.factor(train_full$source_class)
+
+```
+
+```{r `waterpoint_type`, `waterpoint_type_group`}
+#'`waterpoint_type`, `waterpoint_type_group`
+#'#' I keep the more precise factor `waterpoint_type`.
+
+train_full %>% group_by(waterpoint_type_group, waterpoint_type) %>% tally()
+train_full = train_full %>% dplyr::select( - waterpoint_type_group)
+
+train_full$waterpoint_type = as.factor(train_full$water_quality)
+levels(train_full$waterpoint_type)[is.na(levels(train_full$waterpoint_type))] <- "unknown"
+
+summary(train_full$waterpoint_type)
+
+```
+
+## DATA CLEANING - GEOGRAPHICAL VARIABLES 
+
+```{r 'latitude', 'longitude' - imputing zeros from mean}
+## Geographic information
+train_full_checkpoint4 = train_full
+
+#' Latitude ranges in [-11.65,-2e-08] and longitude ranges in [0.0,40.35]. The scatter plot suggests that 0s indicate the coordinates are missing.
+
+#+ initial_coord_map, fig.width = 10, fig.height = 4, fig.cap = "The points (0,0) look like missing values."
+p1 = ggplot(train_full, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+train_full = train_full %>%
+  mutate(latitude = ifelse(latitude > -1e-06, NA, latitude)) %>%
+  mutate(longitude = ifelse(longitude < 1e-06, NA, longitude))
+p2 = ggplot(train_full, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+
+source("http://peterhaschke.com/Code/multiplot.R")
+multiplot(p1, p2, cols = 2)
+# could add map later if useful 
+
+
+train_full %>% group_by(region, region_code, district_code) %>% tally()
+
+#' I guess that, in increasing degree of precision, the geographic information is given by
+#'
+#' * `region` (or `region_code`)
+#' * `district_code` within `region`
+#' * `ward` 
+#' * `subvillage`
+#' * `longitude`x`latitude`
+#'
+#' I keep the region (as a categorical predictor) and latitude, longitude (as numerical predictors). 
+#' However, before I remove the other variables, 
+#' I use the district-within-region information to fill in a few missing longitude and latitude values. 
+#' The input long/lat coordinates for some points are (0,0), which doesn't make sense as this location is not in Tanzania. 
+#' But there are no missing values in the region and district columns, 
+#' so I can substitute missing individual long/lat values with their district *mean* long/lat.
+
+#+
+## Compute averages in districts within regions
+  train_full$latitude = as.numeric(train_full$latitude)
+  train_full$longitude = as.numeric(train_full$longitude)
+  train_full <- train_full %>% mutate(latitude = ifelse(latitude == -0.00000002, NA, latitude)) 
+  train_full <- train_full %>% mutate(longitude = ifelse(longitude == 0, NA, longitude)) 
+
+train_full = train_full %>% 
+  group_by(region,district_code) %>%
+  mutate(district.long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(district.lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+
+## Compute averages in regions (just in case the above is also NA)
+train_full = train_full %>%
+  group_by(region) %>%
+  mutate(region.long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(region.lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+## "Impute" missing longitude/latitude values
+train_full = train_full %>%
+  mutate(longitude = ifelse(!is.na(longitude), longitude,
+                            ifelse(!is.na(district.long), district.long, region.long))) %>%
+  mutate(latitude = ifelse(!is.na(latitude), latitude,
+                           ifelse(!is.na(district.lat), district.lat, region.lat)))
+
+train_full$region = as.factor(train_full$region)
+
+
+```
+
+```{r 'region_code', 'district_code', 'ward', 'subvillage' - dropped}
+
+# drop the rest
+train_full = train_full %>% dplyr::select( - region_code, - district_code,
+                        - region.long, - region.lat,
+                        - district.long, - district.lat,
+                        - ward , - subvillage)
+
+```
+
+```{r 'lga' - transform to rural/urban/other}
+#' Finally, `lga` (local geographic area?) is interesting because there are distinct areas (e.g. *arusha*) 
+#' but some of them are split into rural and urban (e.g., *arusha rural* and *arusha urban*). 
+#' I transform this variable into a new feature that takes three values: rural, urban and other.
+
+summary(as.factor(original_full$lga))
+summary(as.factor(train_full$lga))
+
+train_full = train_full %>% mutate(lga = ifelse( grepl(" rural", lga), "rural",
+                                     ifelse( grepl(" urban", lga), "urban","other")))
+
+train_full$lga = as.factor(train_full$lga)
+
+```
+
+```{r 'gps_height' = enrich with external data}
+
+
+latlongdata <- train_full[,c("longitude","latitude")]
+latlongaltdata <-train_full[,c("gps_height","longitude","latitude","id")]
+
+# http://www.gpsvisualizer.com/elevation 
+
+write.csv(latlongdata, "latlongdata2.csv")
+
+ external_gps_height <- read_delim("external_gps_height2.txt", 
+                                    "\t", escape_double = FALSE, trim_ws = TRUE)
+  
+  gps <- external_gps_height[,2:4]
+  
+  
+ compare <- merge(x= latlongaltdata, y = gps, by="latitude", all.x = TRUE)
+  compare2 <- compare %>% mutate(altdif = compare$gps_height - compare$`altitude (m)`, 
+                                 altdifabs = abs(compare$gps_height - compare$`altitude (m)`), 
+                                 altdifper = ((compare$gps_height - compare$`altitude (m)`)/compare$gps_height)*100, 
+                                 altdifperabs = abs((compare$gps_height - compare$`altitude (m)`)/compare$gps_height)*100)
+  
+  compare3 = compare2 %>% dplyr::select(-compare2$longitude.y)
+  
+
+
+bigdifs <- top_n(compare3, 80, compare3$altdifabs) 
+qplot(bigdifs$altdifabs, data=bigdifs, geom="histogram", bins=50) 
+
+ggplot(bigdifs, aes(x=altdifabs))+ geom_histogram(aes(y = ..density..), bins=50) + geom_density() + scale_x_continuous(limits = c(100,200))
+
+ggplot(data=bigdifs, aes(x = as.numeric(bigdifs$altdifabs)) +
+  geom_bar(stat = "identity", fill="skyblue2")) + geom_smooth()
+
+mapt <- map('worldHires','Tanzania', interior = TRUE)
+
+p1 = ggplot(train_full, aes(x = longitude, y = latitude, color = gps_height)) + geom_point() + geom_point(data = bigdifs, x =bigdifs$longitude.x , y=bigdifs$latitude, colour="red")
+p2 = ggplot(compare3, aes(x = longitude.x, y = latitude, color = compare3$`altitude (m)`)) + geom_point() +  geom_point(data = bigdifs, x =bigdifs$longitude.x , y=bigdifs$latitude, colour="red")
+
+multiplot(p1, p2, cols=2)
+
+
+
+sbbox <- make_bbox(lon = bigdifs$longitude.x, lat = bigdifs$latitude, f = .1)
+sbbox
+
+sq_map <- get_map(location = sbbox, maptype = "satellite", source = "google")
+s1 <- ggmap(sq_map)  + geom_point(data = bigdifs, mapping = aes(x = longitude.x, y = latitude), color = "red")
+s1
+
+
+
+
+
+# notice a few things
+# external source never has negative, this df does
+# they are generally v simialr (median = 1.6%, mean = 34%, 3rd quartile = 5%, however some )
+# of the few that are way off it seems likely the data is wrong as the rest of points correlate well, see map
+# for this reason I am going to wholesale take the external data source and drop original gps_height
+
+  compare4 <- compare3 %>% dplyr::select(altitude = `altitude (m)`, id)
+
+  train_full <- merge(train_full, compare4, by = 'id')
+
+#train_full <- train_full %>% select(-gps_height)
+```
+
+
+## DATA CLEANING - DATE/TIME VARIABLES
+
+```{r 'construction year' - transformed to years of operation & 'time since checked'}
+
+#' ### Day/Month/Year/Time information
+#'
+#' There is some interesting time information as well: `date_recorded` and `construction_year`. 
+#' Unfortunately, the year of construction is missing for about 35% of the data points. 
+#' I convert it to `operation_years` by subtracting the year in which the status was recorded. 
+#' There are a few negative years of operation! I set those to missing, as a clerical error might have occurred.
+
+train_full_checkpoint5 = train_full
+
+train_full3 <- train_full %>% mutate(construction_year = ifelse(construction_year < 1800,NA,construction_year))
+train_full3$construction_year <- cut(train_full3$construction_year, 10, include.lowest=TRUE)
+qplot(construction_year, data=train_full3, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+original_full2 <- original_full
+original_full2$construction_year <- cut(original_full2$construction_year, 1000, include.lowest=TRUE)
+qplot(construction_year, data=original_full2, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+     train_full = train_full %>% mutate(date_recorded = ymd(date_recorded)) %>%
+  mutate(operation_years = lubridate::year(date_recorded) - construction_year) %>%
+  mutate(operation_years = ifelse(operation_years < 0, NA, operation_years))
+
+
+
+
+#Date recorded - remove, 
+#but add 1 derived features : # of days since Jan 1 2014
+#############################################################################################
+#date_recorded_offset_days <- #as.numeric(as.Date("2014-01-01") - #as.Date(train$date_recorded))
+#train <- train[, -which(names(train) == "date_recorded")]
+#train <- cbind(train, date_recorded_offset_days)
+  
+     
+```
+
+```{r 'date_recorded', 'month recorded' - tranform to day or year and season}
+#' I wonder if some pumps are more likely to not function during some seasons than others. 
+#' From [Expert Africa](https://www.expertafrica.com/tanzania/info/tanzania-weather-and-climate):
+#' *Tanzania has two rainy seasons: The short rains from late-October to late-December, 
+#' a.k.a. the Mango Rains, and the long rains from March to May.*
+#'
+#' So I create a season variable. If there is a seasonal effect, it might be even better to include the recorded day of the year as an integer from 1 to 365. (Another alternative is the recorded month, either as a numerical or a categorical variable.)
+
+#+
+train_full = train_full %>%
+  mutate(day_of_year = yday(date_recorded)) %>%
+  mutate(month_recorded = lubridate::month(date_recorded)) %>%
+  mutate(season = ifelse( month_recorded <= 2, "dry short",
+                          ifelse( month_recorded <= 5, "wet long",
+                                  ifelse(month_recorded <= 9, "dry long", "wet short")))) %>%
+  dplyr::select( - date_recorded, - month_recorded, - construction_year)
+
+train_full$season = as.factor(train_full$season)
+
+#' I keep the categorical `season` and the numerical `day_of_year`.
+# ### Other categorical variables
+#'There are three more categorical variables, with numerous distinct levels.
+```
+
+## DATA CLEANING - OTHER VARIABLES 
+
+```{r 'funder', 'installer' 'wpt name' - drop wpt_name & reduce number of factors}
+# ### Other categorical variables
+#'There are three more categorical variables, with numerous distinct levels.
+
+str(as.factor(original_full$funder))
+
+train_full_checkpoint5a <- train_full
+#+
+cbind(
+  train_full %>% group_by(funder) %>% tally() %>% arrange(desc(n)) %>% dplyr::slice(1:10),
+  train_full %>% group_by(installer) %>% tally() %>% arrange(desc(n)) %>% dplyr::slice(1:10),
+  train_full %>% group_by(wpt_name) %>% tally() %>% arrange(desc(n)) %>% dplyr::slice(1:10)
+)
+
+#levenshteinSim("afric","africa")
+#levenshteinSim("afric","worldvis")
+#str(train_full$funder)
+
+#' Of these `funder` and `installer` have a few large categories (more than 500 instances), 
+#' so I keep those and group their smaller categories under *other*. I remove `wpt_name` since I am not even sure what this is.
+
+#+
+summary(as.factor(train_full$installer))
+
+train_full = train_full %>% dplyr::select( - wpt_name) %>%
+  mutate(funder = myreduce.levels(funder)) %>%
+  mutate(installer = myreduce.levels(installer)) 
+
+train_full$funder = as.factor(train_full$funder)
+train_full$installer = as.factor(train_full$installer)
+summary(train_full$installer)
+summary(train_full$funder)
+
+
+## also want to lowcase everrything 
+
+train_full$installer = factor(tolower(train_full$installer))
+train_full$funder = factor(tolower(train_full$funder))
+
+
+```
+
+```{r 'num_private', 'id' - drop as useless}
+
+#' Finally, `num_private` is mostly 1s; there is only one instance with management == "none" and it is in the training data.
+
+#+
+train_full = train_full %>% dplyr::select( - num_private )
+
+
+```
+
+```{r 'basin', 'public_meeting', 'permit' - leaves as look fine}
+
+## Basin looks good so will leave it 
+summary(as.factor(train_full$basin))
+train_full$basin = as.factor(train_full$basin)
+
+## Public_meeting is Boolean - lots of NAs but looks good 
+summary(as.factor(train_full$public_meeting))
+train_full$public_meeting = as.factor(train_full$public_meeting)
+
+## Permit same as above 
+summary(as.factor(train_full$permit))
+train_full$permit = as.factor(train_full$permit)
+
+```
+
+```{r 'management', 'management_group' - leave for now but need to look at / drop one}
+
+## Management has unkowns which should be made NAs but apart from that good
+summary(as.factor(train_full$management))
+train_full$management = as.factor(train_full$management)
+
+## Management_group less granular of above but will keep it for now 
+summary(as.factor(train_full$management_group))
+train_full$management_group = as.factor(train_full$management_group)
+
+```
+
+```{r 'amount_tsh' - drop as over 70% missing values}
+
+
+#' I exclude `amount_tsh` because about 70% of the values are missing.
+train_full = train_full %>% dplyr::select( - amount_tsh)
+
+```
+
+## MISSINGS - EXAMINATION 
+
+```{r Number of  & creating no NA dataset }
+#' ### Missingness
+#'
+#' Which features have a lot of missing values?
+## NUMBERS OF NAS
+mean.na = function(x) {	mean(is.na(x)) }
+num_NAs = data.frame(t(train_full %>% summarise_each(funs(mean.na))))
+num_NAs$variable = rownames(num_NAs)
+colnames(num_NAs) = c("num_nas","variable")
+num_NAs2 = dplyr::arrange(num_NAs, desc(num_nas))
+num_NAs2
+
+
+# whie gps_height still in
+mean.na = function(x) {	mean(is.na(x)) }
+num_NAs = data.frame(t(train_full_checkpoint4 %>% summarise_each(funs(mean.na))))
+num_NAs$variable = rownames(num_NAs)
+colnames(num_NAs) = c("num_nas","variable")
+num_NAs2 = dplyr::arrange(num_NAs, desc(num_nas))
+
+## funder, gps_height, and installer bost largest number of NAs with ~35% each 
+
+train_full_checkpoint6 = train_full
+
+train_full_narm = train_full[complete.cases(train_full),]
+
+train_full_narm_n <- train_full[rowSums(is.na(train_full)) < 2, ]
+
+## drop gps_height as we now have altitude 
+
+train_full <- train_full %>% dplyr::select(-gps_height)
+
+```
+
+```{r examining NAs distribution}
+
+#
+#' ### Non-random missingness by region
+#'
+#' There is also information about the number of people who use the pump, `population`. 
+#' Since `gps_height` has a strong spatial component, it might be related to the elevation above sea level? 
+#' Both features have more than 30% missing values, and moreover, these are not missing at random. 
+#' (So I do not attempt to impute them.)
+#+ gps_height_population, fig.width=10, fig.height=4
+p1 = ggplot(train_full, aes(x = longitude, y = latitude, color = altitude)) + geom_point()
+p2 = ggplot(train_full, aes(x = longitude, y = latitude, color = population)) + geom_point()
+p3 = ggplot(train_full, aes(x = longitude, y = latitude, color = operation_years)) + geom_point()
+
+multiplot(p1, p2, p3, cols=3)
+
+p4 = ggplot(train_full, aes(x = longitude, y = latitude, color = status_group)) + geom_point()
+p4
+
+
+
+summary(train_full$population)
+################## POPULATION 1???? 
+
+
+
+train_full$season
+
+qplot(season, data=train_full, geom="bar", fill=status_group) + theme(legend.positsion = "top")
+
+train_full$operation_years
+
+qplot(operation_years, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top")
+
+
+```
+
+```{r moving status_group to last column}
+
+train_full <- cbind(train_full, train_full$status_group)
+train_full <- train_full %>% dplyr::select(-status_group)
+names(train_full)[names(train_full) == 'train_full$status_group'] <- 'status_group'
+
+```
+
+## THIRD CATEGORY 
+
+```{r fluoride abandoned - never for needs repairs }
+
+table(train_full$water_quality, train_full$status_group)
+prop.table(table(train_full$water_quality, train_full$status_group), margin = 1)
+qplot(water_quality, data=train_full, geom="bar", fill=status_group) + theme(legend.position = "top")
+
+train_full <- train_full %>% mutate(fluride_abandom = ifelse(water_quality == "fluoride abandoned",1,0))
+train_full$fluride_abandom <- as.numeric(train_full$fluride_abandom)
+
+train_repair <- train_full %>% dplyr::filter(status_group == "functional needs repair")
+train_funct <- train_full %>% dplyr::filter(status_group == "functional")
+train_nonfun <- train_full %>% dplyr::filter(status_group == "non functional")
+
+train_funct_prop <- sample_n(train_funct,3596,replace=FALSE)
+train_nonfun_prop <- sample_n(train_nonfun,3596,replace=FALSE)
+
+train_prop_table <- rbind(train_funct_prop,train_nonfun_prop,train_repair)
+
+qplot(water_quality, data=train_prop_table, geom="bar", fill=status_group) + theme(legend.position = "top") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+table(train_prop_table$water_quality, train_prop_table$status_group)
+prop.table(table(train_prop_table$water_quality, train_prop_table$status_group), margin = 1) 
+
+#pxx = ggplot(train_full, aes(x = id, y = latitude, color = status_group)) + geom_point() + xlab("variables splice") + ylab("n-dimensions")
+#pxx
+```
+
+
+## FEATURE SELECTION
+
+```{r feature selection}
+
+null.model <- glm(status_group ~ 1, data = train_full, family = binomial)
+forth <- step(null.model, direction = "forward", status_group~., trace=0)
+names(forth$coefficients)[-1]
+
+forth
+```
+
+
+## MODELLING 
+
+```{r rpart single tree}
+
+# SIMPLE RPART MODEL 
+#train_gps <- train_full_checkpoint6 %>% dplyr::select(-altitude)
+
+
+#df = train_full
+
+#{set.seed(145)
+ # smp_size_80 <- floor(0.80 * nrow(df))
+#  train_ind <- sample(seq_len(nrow(df)), size = smp_size_80)
+ # train_1 <- df[train_ind, ]
+#  test_1 <- df[-train_ind, ]}
+
+#fit <- rpart(status_group ~ .,  method="class",minsplit=10, data=train_1)
+
+#pred = predict(fit, test_1,type="class")
+#summary(test_1$status_group) 
+
+#table(pred,test_1$status_group)
+#confmat_1 <- table(pred,test_1$status_group)
+#confmat_1
+
+#(confmat_1[1] + confmat_1[5] + confmat_1[9]) / sum(confmat_1)
+
+
+
+#printcp(fit) # display the results 
+#plotcp(fit) # visualize cross-validation results 
+#summary(fit) # detailed summary of splits
+
+#plot(fit, uniform=TRUE, 
+ #    main="Classification Tree for Funding")
+#text(fit, use.n=TRUE, all=TRUE, cex=.8)
+
+
+```
+
+```{r RandomForest - FINAL MODEL USED!}
+
+train_full_checkpoint6a <- train_full
+#train_full <- train_full %>% dplyr::select(-id)
+
+df = train_full[complete.cases(train_full),]
+runs = 140:145
+stable = ""
+btable = ""
+
+for (i in runs){
+{set.seed(i)
+  smp_size_80 <- floor(0.80 * nrow(df))
+  train_ind <- sample(seq_len(nrow(df)), size = smp_size_80)
+  train_1 <- df[train_ind, ]
+  test_1 <- df[-train_ind, ]}
+
+  
+
+fit <- randomForest(status_group ~ .,  method="class",minsplit=10, data=train_1, importance = TRUE, ntree= 300)
+
+varImpPlot(fit)
+
+pred = predict(fit, test_1)
+
+
+summary(test_1$status_group) 
+
+table(pred,test_1$status_group)
+confmat_1 <- table(pred,test_1$status_group)
+confmat_1
+
+acc = (confmat_1[1] + confmat_1[5] + confmat_1[9]) / sum(confmat_1)
+btable = append(btable,acc)
+stable = append(stable,i)
+
+
+}
+
+
+as.numeric(max(btable[2:length(btable)])) - as.numeric(min(btable[2:length(btable)]))
+btable
+stable
+max(btable)
+confmat_1
+
+# seed 30, ntree=1, 0.7477006
+# seed 30, ntree=10, 0.80039675
+# seed 30, ntree=100, 0.8151488
+# seed 30, ntree=100,data=super = "0.819381107491857"
+# seed 30, ntree=500, 0.8149684
+# seed 30, ntree=2000, 0.8133454
+
+# seed 301:303, ntree=100, mtry=def: "0.81190261496844"  "0.815870153291253" "0.815509467989179"
+# seed 301:303, ntree=100, mtry=3: "0.809017132551848" "0.817312894499549" "0.813886384129847"
+# seed 301:303, ntree=100, mtry=7: "0.811361587015329" "0.810459873760144" "0.813345356176736"
+# seed 301:303, ntree=100, mtry=9: "0.808836789900812" "0.81009918845807"  "0.812804328223625"
+# seed 301:303, ntree=300. mtry= "0.813525698827773" "0.81785392245266"  "0.815689810640216"
+
+# seed 1001:1010, ntree=300, mtry=def, data=super, "0.816775244299674" "0.817752442996743" "0.806351791530945" "0.810260586319218" "0.814657980456026" "0.807328990228013" "0.816123778501629" "0.810097719869707" "0.814169381107492" "0.813680781758958"
+
+
+# final seed iterations table 
+ctable = btable
+ftable <- cbind(stable,ctable)
+ftable <- as.data.frame(ftable)
+ftable2 <- ftable[-1,]
+ftable2$ctable <- as.numeric(as.character(ftable2$ctable))
+
+p <- ggplot(ftable2, aes(as.numeric(stable), ctable))
+p + geom_point() + geom_hline(yintercept = mean(ftable2$ctable)) + geom_hline(yintercept = max(ftable2$ctable)) +  ylab("accuracy") + 
+  xlab("optimization attempts") + ggtitle("Random Forest Optimisation Iterations") + annotate(geom="text", label=(paste("Mean:",format(round(mean(ftable2$ctable),4),nsmall=2),sep="")), x=168, y=mean(ftable2$ctable), vjust=-0.3)+ annotate(geom="text", label=(paste("Max:",format(round(max(ftable2$ctable),4),nsmall=2),sep="")), x=170, y=max(ftable2$ctable), vjust=-0.3) 
+
+```
+
+```{r random forest new package}
+#install.packages("e1071", dependencies = TRUE)
+
+#df = train_full[complete.cases(train_full),]
+#df = na.exclude(df)
+
+#x <- df[,(length(df)-1)]
+#y <- df[,(length(df))]
+
+#control <- trainControl(method="repeatedcv", number=2, repeats=2)
+#seed <- 7
+#metric <- "Accuracy"
+#set.seed(seed)
+#mtry <- sqrt(length(x))
+#tunegrid <- expand.grid(.mtry=mtry)
+#rf_default <- train(status_group~., data=df, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+#print(rf_default)
+
+
+# Random Search
+#control <- trainControl(method="repeatedcv", number=10, repeats=3, search="random")
+#set.seed(seed)
+#mtry <- sqrt(length(x))
+#rf_random <- train(status_group~., data=df, method="rf", metric=metric, tuneLength=15, trControl=control)
+#print(rf_random)
+#plot(rf_random)
+
+
+# Grid search optimisation
+#control <- trainControl(method="repeatedcv", number=10, repeats=3, search="grid")
+#set.seed(seed)
+#tunegrid <- expand.grid(.mtry=c(1:15))
+#rf_gridsearch <- train(status_group~., data=df, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+#print(rf_gridsearch)
+#plot(rf_gridsearch)
+```
+
+```{r H2O}
+## H20
+
+## don't forget you currently have both the train/test seed &&& and h2o seed set to 'i' this should be changed to A/B properly later 
+
+#df = train_full
+#atable = ""
+
+
+#for( i in 80:total)
+#  {
+#{set.seed(i)
+#  smp_size_80 <- floor(0.80 * nrow(df))
+#  train_ind <- sample(seq_len(nrow(df)), size = smp_size_80)
+#  train_1 <- df[train_ind, ]
+#  test_1 <- df[-train_ind, ]}
+
+
+#localH2O = h2o.init()
+#predictors = c("funder","installer","management",
+#               "region","lga","population",
+ #              "latitude","longitude","altitude",
+  #             "scheme_management",
+   #            "public_meeting","permit",
+    #           "water_quality","quantity",
+     #          "payment_type","source","source_class",
+      #         "management","management_group",
+       #        "basin","extraction_type","waterpoint_type",
+        #       "day_of_year","season","operation_years")
+#target = "status_group"
+#trainHex = as.h2o(train_1, destination_frame = "train.hex")
+#testHex = as.h2o(test_1, destination_frame = "test.hex")
+
+#rfHex = h2o.randomForest(
+ # x = predictors,
+#  y = target,
+ # training_frame = trainHex,
+#  model_id = "rf_ntrees1000",
+#  ntrees = 100, mtries = 3,
+#  seed = i)
+
+#h2o_conf_matrix <- h2o.confusionMatrix(rfHex)
+
+#h2o_predictions = as.data.frame(h2o.predict(rfHex,testHex))[,1]
+#summary(h2o_predictions)
+#summary(test_1$status_group)
+#conftab_1 = table(h2o_predictions,test_1$status_group)
+
+#
+#acc = (conftab_1[1] + conftab_1[5] + conftab_1[9]) / sum(conftab_1)
+#atable = append(atable,acc)
+
+#}
+
+#as.numeric(max(atable[2:length(atable)])) - as.numeric(min(atable[2:length(atable)]))
+#atable
+#max(atable)
+#conftab_1
+
+
+
+```
+
+```{r XGBOOST}
+
+
+#df= train_full
+
+#{set.seed(101)
+ # smp_size_80 <- floor(0.80 * nrow(df))
+#  train_ind <- sample(seq_len(nrow(df)), size = smp_size_80)
+ # train_1 <- df[train_ind, ]
+#  test_1 <- df[-train_ind, ]}
+
+
+
+#data(train_1, package='xgboost')
+#data(test_1, package='xgboost')
+#train_1a <- train_1
+#test_1a <- test_1
+
+#str(train_1a)
+#Each variable is a list containing two things, label and data:
+
+#dim(train_1a$data)
+
+
+#bstSparse <- xgboost(data = train_1a$data, label = train_1a$label, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "multi:softmax", num_class = 3)
+
+#pred <- predict(bst, test$data)
+## how do we convert output to one of three classes? 
+
+# bstDense <- xgboost(data = as.matrix(train_1a$data), label = train_1a$label, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "multi:softmax", num_class = 3)
+
+
+```
+
+```{r LDA}
+
+#df = train_full[complete.cases(train_full),]
+
+#{set.seed(1002)
+ # smp_size_80 <- floor(0.80 * nrow(df))
+  #train_ind <- sample(seq_len(nrow(df)), size = smp_size_80)
+  #train_1 <- df[train_ind, ]
+  #test_1 <- df[-train_ind, ]}
+
+#ldatest <- lda(formula = status_group ~ ., 
+      #   data = train_1)
+```
+
